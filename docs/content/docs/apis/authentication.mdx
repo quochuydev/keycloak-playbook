@@ -1,0 +1,296 @@
+---
+title: Authentication APIs
+description: OIDC endpoints — get tokens, refresh, logout, introspect, userinfo
+---
+
+All endpoints below live under the realm base:
+
+```
+https://iam.example.com/realms/product/protocol/openid-connect
+```
+
+You can also discover them from the well-known document:
+
+```bash
+curl -s https://iam.example.com/realms/product/.well-known/openid-configuration | jq .
+```
+
+## 1. Authorization Code + PKCE (preferred for all frontends)
+
+This is the flow we actually use from the Account App and every Next.js frontend.
+
+### Step 1 — redirect the browser
+
+```
+GET https://iam.example.com/realms/product/protocol/openid-connect/auth
+  ?client_id=frontend-app
+  &response_type=code
+  &scope=openid profile email organization
+  &redirect_uri=https://app.example.com/api/auth/callback/keycloak
+  &state=5d41402abc4b2a76b9719d911017c592
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256
+```
+
+Keycloak authenticates the user and redirects back with `?code=...&state=...`.
+
+### Step 2 — exchange the code
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=authorization_code" \
+  -d "client_id=frontend-app" \
+  -d "code=b1c2d3e4-5678-90ab-cdef-1234567890ab.abcdef01-2345-6789-abcd-ef0123456789.frontend-app" \
+  -d "redirect_uri=https://app.example.com/api/auth/callback/keycloak" \
+  -d "code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" | jq .
+```
+
+**Sample response (200):**
+
+```json
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6Ijhf...",
+  "expires_in": 300,
+  "refresh_expires_in": 1800,
+  "refresh_token": "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCIsImtpZCI6...",
+  "token_type": "Bearer",
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6Ijhf...",
+  "not-before-policy": 0,
+  "session_state": "c7f6e2a1-5555-4444-aaaa-bbbbccccdddd",
+  "scope": "openid profile email organization"
+}
+```
+
+## 2. Client Credentials (service-to-service)
+
+Used by the gateway or internal services. The client must be **confidential** with Service Accounts enabled.
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token \
+  -d "grant_type=client_credentials" \
+  -d "client_id=gateway" \
+  -d "client_secret=$KEYCLOAK_GATEWAY_SECRET" | jq .
+```
+
+**Sample response (200):**
+
+```json
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5...",
+  "expires_in": 300,
+  "refresh_expires_in": 0,
+  "token_type": "Bearer",
+  "not-before-policy": 0,
+  "scope": "profile email"
+}
+```
+
+Note: no refresh token — obtain a new one by calling this endpoint again.
+
+## 3. Direct Access Grants (Account App login form)
+
+Use only from the Account App's server-side code. Requires **Direct access grants** enabled on the client.
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token \
+  -d "grant_type=password" \
+  -d "client_id=account-app" \
+  -d "username=alice@acme.test" \
+  -d "password=$PASSWORD" \
+  -d "scope=openid profile email organization" | jq .
+```
+
+**Sample response (200):** identical shape to authorization-code response.
+
+**Sample error (401 — wrong password):**
+
+```json
+{
+  "error": "invalid_grant",
+  "error_description": "Invalid user credentials"
+}
+```
+
+**Sample error (401 — account not verified):**
+
+```json
+{
+  "error": "invalid_grant",
+  "error_description": "Account is not fully set up"
+}
+```
+
+<Callout type="warn">
+Direct grant bypasses MFA / required-actions UI. Use it only for username+password pre-check. For MFA-protected accounts, fall back to authorization-code.
+</Callout>
+
+## 4. Refresh Token
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token \
+  -d "grant_type=refresh_token" \
+  -d "client_id=frontend-app" \
+  -d "refresh_token=$REFRESH_TOKEN" | jq .
+```
+
+**Sample response (200):** same shape as code exchange. With refresh rotation on, the returned `refresh_token` is **new** — replace the old one.
+
+## 5. Logout (end session)
+
+Kill the SSO session for the current user. Requires the refresh token.
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/logout \
+  -d "client_id=frontend-app" \
+  -d "refresh_token=$REFRESH_TOKEN"
+```
+
+**Response:** `204 No Content`. The access token (if still unexpired) is not automatically invalidated — rely on its short TTL or use introspection.
+
+### RP-initiated logout with redirect (OIDC standard)
+
+```
+GET https://iam.example.com/realms/product/protocol/openid-connect/logout
+  ?id_token_hint=<id_token>
+  &post_logout_redirect_uri=https://app.example.com/signed-out
+  &client_id=frontend-app
+```
+
+## 6. Token Introspection (gateway uses this sparingly)
+
+Confidential client only.
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token/introspect \
+  -u "gateway:$KEYCLOAK_GATEWAY_SECRET" \
+  -d "token=$ACCESS_TOKEN" | jq .
+```
+
+**Sample response (200 — active token):**
+
+```json
+{
+  "exp": 1714061100,
+  "iat": 1714060800,
+  "jti": "92f3e4ba-abcd-4321-8765-1234567890ab",
+  "iss": "https://iam.example.com/realms/product",
+  "aud": ["gateway", "account"],
+  "sub": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+  "typ": "Bearer",
+  "azp": "frontend-app",
+  "preferred_username": "alice",
+  "email": "alice@acme.test",
+  "email_verified": true,
+  "realm_access": { "roles": ["org-user", "org-owner"] },
+  "resource_access": {
+    "frontend-app": { "roles": ["billing.read", "billing.write"] }
+  },
+  "organization": {
+    "acme": {
+      "id": "b9f2c1a0-1234-5678-9abc-def012345678",
+      "roles": ["org-owner"]
+    }
+  },
+  "scope": "openid profile email organization",
+  "active": true
+}
+```
+
+**Sample response (200 — inactive / revoked / expired):**
+
+```json
+{ "active": false }
+```
+
+<Callout type="info">
+Prefer **offline signature verification via JWKS** in the gateway. Introspection adds a network hop on every request and should be reserved for opaque tokens or high-sensitivity endpoints.
+</Callout>
+
+## 7. UserInfo
+
+```bash
+curl -s https://iam.example.com/realms/product/protocol/openid-connect/userinfo \
+  -H "Authorization: Bearer $ACCESS_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+{
+  "sub": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+  "email_verified": true,
+  "name": "Alice Nguyen",
+  "preferred_username": "alice",
+  "given_name": "Alice",
+  "family_name": "Nguyen",
+  "email": "alice@acme.test",
+  "organization": {
+    "acme": {
+      "id": "b9f2c1a0-1234-5678-9abc-def012345678"
+    }
+  }
+}
+```
+
+## 8. JWKS (public keys)
+
+The gateway fetches this once at boot and caches for 10 minutes.
+
+```bash
+curl -s https://iam.example.com/realms/product/protocol/openid-connect/certs | jq .
+```
+
+**Sample response (200):**
+
+```json
+{
+  "keys": [
+    {
+      "kid": "8f1c44b5-...",
+      "kty": "RSA",
+      "alg": "RS256",
+      "use": "sig",
+      "n": "wP0mQbVQpSe...",
+      "e": "AQAB",
+      "x5c": ["MIICmzCC..."],
+      "x5t": "q5...=",
+      "x5t#S256": "BC...="
+    }
+  ]
+}
+```
+
+## 9. Token Exchange (optional — internal services)
+
+Requires the `token-exchange` feature and permission grants. Useful when the gateway needs a narrower token for a downstream service.
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token \
+  -u "gateway:$KEYCLOAK_GATEWAY_SECRET" \
+  -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+  -d "subject_token=$USER_ACCESS_TOKEN" \
+  -d "requested_token_type=urn:ietf:params:oauth:token-type:access_token" \
+  -d "audience=service-billing" | jq .
+```
+
+**Sample response (200):**
+
+```json
+{
+  "access_token": "eyJhbGciOi...",
+  "expires_in": 300,
+  "token_type": "Bearer",
+  "scope": "profile email"
+}
+```
+
+## Common Errors
+
+| HTTP | `error` | Cause |
+| --- | --- | --- |
+| 400 | `invalid_request` | Missing required parameter (e.g. `code_verifier`) |
+| 400 | `invalid_grant` | Expired / already-used code, wrong redirect_uri, bad refresh token |
+| 401 | `invalid_client` | Wrong client_secret or client doesn't exist |
+| 401 | `unauthorized_client` | Client not allowed this grant type |
+| 403 | `access_denied` | Consent denied, or required action incomplete |

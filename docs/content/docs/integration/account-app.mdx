@@ -1,0 +1,234 @@
+---
+title: Account App
+description: Custom Next.js account UI that wraps Keycloak's OIDC + Account REST API
+---
+
+## What the Account App Owns
+
+The Account App is the **single UI** every other frontend redirects to for:
+
+- Sign in (username/password, social IdP, MFA prompt)
+- Sign up (registration)
+- Email / phone verification
+- Password reset & change
+- Profile view & edit
+- Linked accounts management
+- Active session review & revoke
+
+It is a Next.js app that speaks to Keycloak via:
+
+| Keycloak surface | Used for |
+| --- | --- |
+| OIDC `/auth`, `/token`, `/logout` | Session establishment |
+| Account REST API `/realms/product/account/*` | Self-service profile, sessions, credentials |
+| Gateway → Admin API | Triggering `send-verify-email`, setting required actions, admin password reset |
+| Our SMS SPI | SMS OTP send / verify |
+
+## Pages
+
+```
+app/
+├── login/          # our custom login form; posts to our server action that calls /token (direct grant)
+├── register/       # our custom registration; calls gateway → Admin API createUser + sendVerifyEmail
+├── verify/
+│   ├── email/      # landing page after clicking emailed link
+│   └── phone/      # OTP entry UI
+├── security/
+│   ├── password/   # change password
+│   ├── mfa/        # set up TOTP, SMS 2FA
+│   ├── sessions/   # list + revoke sessions
+│   └── linked/     # linked IdPs
+├── profile/        # username, email, display name, avatar
+└── forgot-password/
+```
+
+## Login Flow — Two Paths
+
+### Path A: Username + password (our UI)
+
+We own the form and call Keycloak directly via **Direct Access Grants**:
+
+```ts
+// app/login/actions.ts
+'use server'
+import { cookies } from 'next/headers'
+
+export async function login(formData: FormData) {
+  const body = new URLSearchParams({
+    grant_type: 'password',
+    client_id: 'account-app',
+    username: String(formData.get('email')),
+    password: String(formData.get('password')),
+    scope: 'openid profile email organization offline_access',
+  })
+  const res = await fetch(
+    `${process.env.KEYCLOAK_ISSUER}/protocol/openid-connect/token`,
+    { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
+  )
+  const json = await res.json()
+  if (!res.ok) {
+    return { error: json.error_description ?? json.error }
+  }
+  cookies().set('session', JSON.stringify({
+    at: json.access_token,
+    rt: json.refresh_token,
+    exp: Date.now() + json.expires_in * 1000,
+  }), { httpOnly: true, secure: true, sameSite: 'lax', path: '/' })
+  return { ok: true }
+}
+```
+
+If the response is `invalid_grant` with `Account is not fully set up`, the user has pending required actions (e.g. VERIFY_EMAIL). Fall back to Path B to let Keycloak walk them through.
+
+### Path B: Redirect to Keycloak (handles MFA + required actions)
+
+For social login, MFA challenges, or stuck accounts, kick the browser to Keycloak's `/auth` endpoint. Same authorization-code + PKCE flow as any other frontend.
+
+## Registration
+
+```ts
+// app/register/actions.ts
+'use server'
+
+export async function register(formData: FormData) {
+  // 1. Create user via gateway → Admin API
+  const createRes = await fetch(`${process.env.GATEWAY_URL}/admin/users`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: formData.get('email'),
+      username: formData.get('email'),
+      firstName: formData.get('firstName'),
+      lastName: formData.get('lastName'),
+      credentials: [{ type: 'password', value: formData.get('password'), temporary: false }],
+      enabled: true,
+      emailVerified: false,
+    }),
+  })
+  if (!createRes.ok) return { error: 'register_failed' }
+  const { id } = await createRes.json()
+
+  // 2. Fire verification email
+  await fetch(`${process.env.GATEWAY_URL}/admin/users/${id}/send-verify-email`, {
+    method: 'POST',
+  })
+
+  return { ok: true, pending: 'verify_email' }
+}
+```
+
+## Email Verification Flow
+
+<Steps>
+<Step>
+After registration, the UI shows "We sent a verification link to alice@acme.test".
+</Step>
+<Step>
+User clicks the link. Keycloak validates the signature, marks `emailVerified=true`, and redirects to our `verify/email` page.
+</Step>
+<Step>
+Our page calls `GET /realms/product/account` to confirm `emailVerified: true`, then prompts the user to continue to login.
+</Step>
+</Steps>
+
+UI should also offer "Resend email" — that hits the gateway which calls `PUT /admin/users/{id}/send-verify-email`.
+
+## SMS Verification Flow
+
+<Steps>
+<Step>
+User opens `security/phone`, enters `+84 900 000 000`.
+</Step>
+<Step>
+Account App calls `POST /realms/product/sms/send`. Renders an OTP entry input.
+</Step>
+<Step>
+User types the code. Account App calls `POST /realms/product/sms/verify`.
+</Step>
+<Step>
+On success, the user attribute `phone_number_verified=true` is set by the SPI. Account App tells the user to continue; next token refresh will carry the new claim.
+</Step>
+</Steps>
+
+## Profile Page
+
+```ts
+// app/profile/data.ts
+import { getAccessToken } from '@/lib/session'
+
+export async function getProfile() {
+  const at = await getAccessToken()
+  const res = await fetch(`${process.env.KEYCLOAK_ISSUER}/account`, {
+    headers: { Authorization: `Bearer ${at}` },
+    cache: 'no-store',
+  })
+  if (!res.ok) throw new Error('profile_failed')
+  return res.json()
+}
+
+export async function saveProfile(next: Record<string, unknown>) {
+  const at = await getAccessToken()
+  const res = await fetch(`${process.env.KEYCLOAK_ISSUER}/account`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${at}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(next),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => null)
+    throw new Error(err?.errors?.[0]?.errorMessage ?? 'save_failed')
+  }
+}
+```
+
+## Password Change
+
+The Account REST API doesn't expose `POST /account/credentials/password`. Two options:
+
+### A. Redirect to Keycloak Credentials page
+
+```ts
+// app/security/password/page.tsx
+const authorize = new URL(`${process.env.KEYCLOAK_ISSUER}/protocol/openid-connect/auth`)
+authorize.searchParams.set('client_id', 'account-app')
+authorize.searchParams.set('response_type', 'code')
+authorize.searchParams.set('scope', 'openid')
+authorize.searchParams.set('redirect_uri', `${process.env.NEXT_PUBLIC_URL}/security/done`)
+authorize.searchParams.set('kc_action', 'UPDATE_PASSWORD')
+```
+
+Keycloak handles the re-auth + new-password input, then redirects back.
+
+### B. Our UI + gateway-proxied Admin reset
+
+We verify the current password by calling `/token` with `grant_type=password` first; if that succeeds, we call Admin API `PUT /users/{id}/reset-password` through the gateway.
+
+Option A is simpler and stays aligned with Keycloak's password policy UI. Option B gives us full control of the form.
+
+## Forgot Password
+
+Send a Keycloak-signed email containing an `execute-actions-email` link:
+
+```ts
+await fetch(`${process.env.GATEWAY_URL}/admin/users/${id}/execute-actions-email?redirect_uri=${redirect}&client_id=account-app`, {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(['UPDATE_PASSWORD']),
+})
+```
+
+## Sessions Page
+
+```ts
+const res = await fetch(`${process.env.KEYCLOAK_ISSUER}/account/sessions`, {
+  headers: { Authorization: `Bearer ${at}` },
+})
+const sessions = await res.json()
+// Render list; DELETE /account/sessions/{id} to revoke
+```
+
+## Pitfalls
+
+- **Direct Grant disables Required Actions.** If we always log in via direct grant we'll never surface the "verify email" or "update password" screens. Detect `invalid_grant` with `Account is not fully set up` and fall through to the redirect flow.
+- **CORS on the Account API.** Add `https://accounts.example.com` to **Clients → account-app → Web origins**.
+- **Email / SMS rate limits.** Wrap gateway endpoints with per-user rate limits (Redis counters) before proxying to Keycloak — the built-in brute-force protection only covers login, not admin actions.
+- **Cookie domain.** If the account app lives at `accounts.example.com` and the product frontends at `app.example.com`, cookies don't cross. Rely on Keycloak's own SSO cookie (on `iam.example.com`) to carry state between subdomains.

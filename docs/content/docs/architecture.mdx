@@ -1,0 +1,106 @@
+---
+title: Architecture & Flow
+description: How the gateway, frontends, account app, and Keycloak interact
+---
+
+## High-Level Topology
+
+```
+                     ┌────────────────────┐
+                     │     Keycloak       │
+                     │ iam.example.com    │
+                     └─────────┬──────────┘
+                               │ OIDC (authz code + PKCE)
+           ┌───────────────────┼────────────────────────┐
+           │                   │                        │
+   ┌───────▼───────┐   ┌───────▼────────┐     ┌─────────▼────────┐
+   │  Account App  │   │  SysAdmin UI   │ ... │     App UI       │
+   │  (Next.js)    │   │  (Next.js)     │     │   (Next.js)      │
+   └───────┬───────┘   └────────┬───────┘     └────────┬─────────┘
+           │  access_token (cookie or header)           │
+           └─────────────────┬───────────────────┬──────┘
+                             │                   │
+                     ┌───────▼───────────────────▼───────┐
+                     │        Backend Gateway            │
+                     │         (Node.js)                 │
+                     │  - verify JWT via JWKS            │
+                     │  - enforce RBAC                   │
+                     │  - proxy to internal services     │
+                     └───────────────────────────────────┘
+```
+
+## Login Flow (Authorization Code + PKCE)
+
+<Steps>
+<Step>
+User visits one of the frontends (e.g. `app.example.com`). The app sees no session and redirects to the **Account App** at `accounts.example.com/login?return_to=...`.
+</Step>
+<Step>
+The Account App initiates OIDC against Keycloak: `GET /realms/product/protocol/openid-connect/auth?client_id=account-app&response_type=code&code_challenge=...&scope=openid+profile+email`.
+</Step>
+<Step>
+Keycloak renders the login UI (or our custom theme). User submits credentials; optionally completes email OTP / SMS OTP / TOTP.
+</Step>
+<Step>
+Keycloak redirects back with `?code=...`. The Account App exchanges the code for tokens via `POST /token`, sets an `HttpOnly` session cookie, then redirects the user back to the original frontend with a short-lived handoff (or by sharing a cookie on a parent domain).
+</Step>
+<Step>
+The frontend now has an access token (held by its own BFF / middleware) and calls the Gateway with `Authorization: Bearer <token>`.
+</Step>
+<Step>
+The Gateway verifies the signature against Keycloak's JWKS, checks `exp`, `iss`, `aud`, and the required roles, then forwards the request.
+</Step>
+</Steps>
+
+## Token Lifetimes
+
+| Token | Default TTL | Where it lives | Refreshed by |
+| --- | --- | --- | --- |
+| Access token | 5 min | In-memory on the frontend BFF, `Authorization` header | Refresh token via `/token` |
+| Refresh token | 30 min (SSO idle) | `HttpOnly Secure SameSite=Lax` cookie on the BFF | Reissued on every use (rotation on) |
+| ID token | 5 min | BFF only, never sent to the browser | — |
+| SSO session | 10 hours | Keycloak-side | User re-authenticates |
+
+Tune these in the realm's **Sessions** and **Tokens** tabs.
+
+## Multi-Frontend SSO
+
+All three product frontends use the **same realm** and the **same Account App** for login. Because Keycloak keeps the SSO cookie on `iam.example.com`, the second frontend silently gets a session through the hidden iframe flow (`prompt=none`). No second password prompt.
+
+## Gateway's Job
+
+The gateway is `bearer-only`. It never initiates a login. Its responsibilities:
+
+1. **Verify** the JWT (signature via cached JWKS, `exp`, `nbf`, `iss`, `aud`).
+2. **Authorize** — check `realm_access.roles` and `organization.<slug>.roles`.
+3. **Enrich** downstream calls with a trusted identity header (`X-User-Id`, `X-Org-Id`) so internal services don't reparse the token.
+4. **Propagate** the access token when calling other OIDC-protected services using token exchange (optional).
+
+## Which App Uses Which Role
+
+| Frontend | Requires realm role | Typical client roles |
+| --- | --- | --- |
+| SysAdmin | `sysadmin` | `realm-admin` on `realm-management` |
+| Admin | `org-owner` (for some org) | `manage-members`, `manage-org` |
+| App | `org-user` (for some org) | feature flags: `billing.read`, `reports.export`, etc. |
+| Account App | any authenticated user | `manage-account` on `account` |
+
+## Account App Responsibilities
+
+The Account App is a custom Next.js UI that replaces Keycloak's built-in Account Console for:
+
+- Login / logout (delegates to Keycloak's `auth` endpoint)
+- Registration (uses Keycloak's registration flow or Admin API)
+- Email / phone verification
+- Password change / reset
+- Profile updates (username, email, display name, avatar)
+
+It talks to Keycloak via:
+
+- **OIDC endpoints** for session establishment
+- **Account REST API** (`/realms/product/account`) for self-service profile actions
+- A small set of **Admin API** calls through the gateway for things the Account API doesn't expose (e.g. triggering SMS OTP via our custom SPI)
+
+## Service-to-Service
+
+Internal services behind the gateway use **client credentials** against a dedicated confidential client (e.g. `service-billing`) to obtain their own tokens for talking to each other, rather than passing the user's access token around. This avoids token scope creep and simplifies audit.

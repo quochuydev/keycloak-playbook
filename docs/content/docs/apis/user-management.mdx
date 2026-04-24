@@ -1,0 +1,296 @@
+---
+title: User Management APIs
+description: Self-service profile, password, and identity updates — and the Admin-side equivalents
+---
+
+There are **two** families of endpoints for user management:
+
+| Family | Path | Who calls it | Auth |
+| --- | --- | --- | --- |
+| **Account REST API** | `/realms/product/account` | The user themselves (Account App) | `Bearer <user access_token>` with `manage-account` role |
+| **Admin REST API** | `/admin/realms/product/users/{id}` | The gateway / sysadmin / admin UIs | `Bearer <admin or service-account token>` |
+
+All Account endpoints below assume `Authorization: Bearer $USER_TOKEN` and `Content-Type: application/json`.
+
+## Get My Profile
+
+```bash
+curl -s https://iam.example.com/realms/product/account \
+  -H "Authorization: Bearer $USER_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+{
+  "id": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+  "username": "alice",
+  "firstName": "Alice",
+  "lastName": "Nguyen",
+  "email": "alice@acme.test",
+  "emailVerified": true,
+  "attributes": {
+    "phone_number": ["+84900000000"],
+    "phone_number_verified": ["true"],
+    "locale": ["en"]
+  },
+  "userProfileMetadata": {
+    "attributes": [
+      { "name": "username", "displayName": "${username}", "required": true, "readOnly": false },
+      { "name": "email",    "displayName": "${email}",    "required": true, "readOnly": false },
+      { "name": "firstName","displayName": "${firstName}","required": true, "readOnly": false },
+      { "name": "lastName", "displayName": "${lastName}", "required": true, "readOnly": false }
+    ]
+  }
+}
+```
+
+## Update My Profile (name / email / username / attributes)
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/account \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "alice",
+    "email": "alice.new@acme.test",
+    "firstName": "Alice",
+    "lastName": "Nguyen",
+    "attributes": {
+      "phone_number": ["+84900000001"],
+      "locale": ["vi"]
+    }
+  }'
+```
+
+**Response (204 No Content)** on success.
+
+**Sample error (400 — email taken):**
+
+```json
+{
+  "errors": [
+    {
+      "errorMessage": "error-email-exists",
+      "params": ["alice.new@acme.test"]
+    }
+  ]
+}
+```
+
+### Email change side-effects
+
+If **Realm settings → Login → Verify email** is on and the email changed, Keycloak sets `emailVerified=false` and triggers a VERIFY_EMAIL required action. The next login forces re-verification. The Account App can also proactively call [Send verify email](./verification#send-verify-email).
+
+### Username change
+
+Allowed only if **Realm settings → Login → Edit username** is on. Otherwise returns 400 `error-user-attribute-read-only`.
+
+## Change Password (Account API)
+
+The Account REST API does not expose password change directly — the Account App must redirect the user to Keycloak's Credentials page **or** call the Admin API via the gateway.
+
+### Via Keycloak's Credentials flow (redirect)
+
+```
+GET https://iam.example.com/realms/product/protocol/openid-connect/auth
+  ?client_id=account-app
+  &response_type=code
+  &scope=openid
+  &redirect_uri=https://accounts.example.com/security/done
+  &kc_action=UPDATE_PASSWORD
+```
+
+Keycloak handles the re-auth + new-password capture and redirects back.
+
+### Via Admin API (gateway proxies)
+
+```bash
+# Reset the user's password — requires admin token with manage-users
+curl -s -X PUT "https://iam.example.com/admin/realms/product/users/$USER_ID/reset-password" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "password",
+    "value": "NewStrongP@ssw0rd!",
+    "temporary": false
+  }'
+```
+
+**Response:** `204 No Content`.
+
+The gateway wraps this behind its own endpoint that first verifies the user's current password via `grant_type=password`.
+
+## Get My Sessions
+
+```bash
+curl -s https://iam.example.com/realms/product/account/sessions \
+  -H "Authorization: Bearer $USER_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "c7f6e2a1-5555-4444-aaaa-bbbbccccdddd",
+    "ipAddress": "203.0.113.7",
+    "started": 1714058000,
+    "lastAccess": 1714060500,
+    "expires": 1714094000,
+    "clients": [
+      { "clientId": "frontend-app", "clientName": "frontend-app" },
+      { "clientId": "account-app",  "clientName": "account-app" }
+    ],
+    "browser": "Chrome/124.0",
+    "current": true
+  }
+]
+```
+
+## Revoke a Specific Session
+
+```bash
+curl -s -X DELETE https://iam.example.com/realms/product/account/sessions/c7f6e2a1-... \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+**Response:** `204`.
+
+## Sign Out of All Sessions
+
+```bash
+curl -s -X DELETE "https://iam.example.com/realms/product/account/sessions?current=false" \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+**Response:** `204`. The *current* session is preserved if you pass `current=false` — omit to also kill the active one.
+
+## Credentials Listing
+
+```bash
+curl -s https://iam.example.com/realms/product/account/credentials \
+  -H "Authorization: Bearer $USER_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "type": "password",
+    "userLabel": "My Password",
+    "createdDate": 1709988800000,
+    "credentialData": "{\"hashIterations\":27500,\"algorithm\":\"pbkdf2-sha256\"}"
+  },
+  {
+    "id": "f1e2d3c4-...",
+    "type": "otp",
+    "userLabel": "Authy",
+    "createdDate": 1712500000000
+  }
+]
+```
+
+## Linked Identity Providers
+
+```bash
+curl -s https://iam.example.com/realms/product/account/linked-accounts \
+  -H "Authorization: Bearer $USER_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "providerName": "google",
+    "displayName": "Google",
+    "linkedUsername": "alice@gmail.com",
+    "connected": true,
+    "social": true
+  },
+  {
+    "providerName": "microsoft",
+    "displayName": "Microsoft",
+    "connected": false,
+    "social": true
+  }
+]
+```
+
+## Admin-Side User Read
+
+Used by SysAdmin / Admin UIs through the gateway.
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/users?email=alice@acme.test&exact=true" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+    "username": "alice",
+    "enabled": true,
+    "emailVerified": true,
+    "firstName": "Alice",
+    "lastName": "Nguyen",
+    "email": "alice@acme.test",
+    "attributes": { "phone_number": ["+84900000000"], "phone_number_verified": ["true"] },
+    "createdTimestamp": 1709988800000,
+    "totp": false,
+    "disableableCredentialTypes": [],
+    "requiredActions": [],
+    "notBefore": 0,
+    "access": {
+      "manageGroupMembership": true,
+      "view": true,
+      "mapRoles": true,
+      "impersonate": false,
+      "manage": true
+    }
+  }
+]
+```
+
+## Admin-Side Create User
+
+```bash
+curl -s -X POST https://iam.example.com/admin/realms/product/users \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "bob",
+    "email": "bob@acme.test",
+    "firstName": "Bob",
+    "lastName": "Tran",
+    "enabled": true,
+    "emailVerified": false,
+    "attributes": { "phone_number": ["+84911111111"] },
+    "credentials": [
+      { "type": "password", "value": "TempP@ssw0rd!", "temporary": true }
+    ]
+  }'
+```
+
+**Response:** `201 Created` with `Location: /admin/realms/product/users/{id}`.
+
+## Admin-Side Disable / Delete
+
+```bash
+# Disable (preferred — keeps audit trail)
+curl -s -X PUT https://iam.example.com/admin/realms/product/users/$USER_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+# Delete permanently
+curl -s -X DELETE https://iam.example.com/admin/realms/product/users/$USER_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Both return `204`.

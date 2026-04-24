@@ -1,0 +1,114 @@
+---
+title: Email & SMS
+description: Configure SMTP for verification/reset emails and install an SMS OTP authenticator
+---
+
+## Email (SMTP)
+
+**Realm settings → Email**
+
+| Field | Example |
+| --- | --- |
+| From | `no-reply@example.com` |
+| From Display Name | *Your Product* |
+| Reply To | `support@example.com` |
+| Host | `smtp.sendgrid.net` |
+| Port | `587` |
+| Encryption | `StartTLS` |
+| Authentication | On |
+| Username | `apikey` |
+| Password | *SMTP token* |
+
+Click **Test connection** — Keycloak sends a test mail to the currently logged-in admin's email.
+
+**Realm settings → Login** — turn on:
+
+- **Verify email** — new users must click the emailed link before the first login.
+- **Forgot password** — exposes the link on the login page.
+
+### Email Templates
+
+Keycloak ships default templates. Override per realm by creating a custom theme:
+
+```
+themes/product/email/
+├── html/
+│   ├── email-verification.ftl
+│   └── password-reset.ftl
+├── text/
+│   └── …
+└── theme.properties
+```
+
+Then **Realm settings → Themes → Email Theme** → `product`.
+
+## SMS OTP
+
+Keycloak has **no built-in SMS provider**. Two options:
+
+### Option A — Community Authenticator (fastest)
+
+Install [keycloak-2fa-sms-authenticator](https://github.com/dasniko/keycloak-2fa-sms-authenticator) or equivalent as a provider jar.
+
+**Dockerfile overlay:**
+
+```dockerfile
+FROM quay.io/keycloak/keycloak:26.0 AS builder
+ADD https://github.com/dasniko/keycloak-2fa-sms-authenticator/releases/download/vX.Y.Z/keycloak-2fa-sms-authenticator.jar \
+    /opt/keycloak/providers/
+RUN /opt/keycloak/bin/kc.sh build
+
+FROM quay.io/keycloak/keycloak:26.0
+COPY --from=builder /opt/keycloak/ /opt/keycloak/
+ENTRYPOINT ["/opt/keycloak/bin/kc.sh"]
+```
+
+Configure the provider with your SMS gateway (Twilio, AWS SNS, Vonage) credentials as environment variables:
+
+```yaml
+KC_SPI_SMS_API_TWILIO_ACCOUNT_SID: ${TWILIO_SID}
+KC_SPI_SMS_API_TWILIO_AUTH_TOKEN:  ${TWILIO_TOKEN}
+KC_SPI_SMS_API_TWILIO_FROM_NUMBER: ${TWILIO_FROM}
+```
+
+**Authentication → Flows → Browser (duplicate) → Add step → SMS OTP → Required**.
+
+Bind the new flow: **Authentication → Bindings → Browser Flow → `Browser with SMS`**.
+
+### Option B — Build Your Own SPI
+
+Implement `AuthenticatorFactory` + `Authenticator`. Skeleton:
+
+```java
+public class SmsOtpAuthenticator implements Authenticator {
+  @Override
+  public void authenticate(AuthenticationFlowContext ctx) {
+    String phone = ctx.getUser().getFirstAttribute("phone_number");
+    String code = generateCode();
+    ctx.getAuthenticationSession().setAuthNote("sms-code", code);
+    smsProvider.send(phone, "Your code: " + code);
+    ctx.challenge(ctx.form().createForm("sms-otp.ftl"));
+  }
+  @Override
+  public void action(AuthenticationFlowContext ctx) {
+    String input = ctx.getHttpRequest().getDecodedFormParameters().getFirst("code");
+    String expected = ctx.getAuthenticationSession().getAuthNote("sms-code");
+    if (expected.equals(input)) ctx.success();
+    else ctx.failureChallenge(INVALID_CREDENTIALS, ctx.form().setError("invalidCode").createForm("sms-otp.ftl"));
+  }
+  // ... required method, configuredFor, setRequiredActions
+}
+```
+
+Package as jar, drop into `/opt/keycloak/providers/`, run `kc.sh build`.
+
+## Triggering Verification from our Apps
+
+Once SMTP/SMS are configured, the Account App triggers verification through:
+
+- **Email verify** — Admin API `PUT /users/{id}/send-verify-email` (see [Verification APIs](../apis/verification))
+- **SMS verify** — custom endpoint exposed by our SPI, or via a Required Action the Account App sets with `PUT /users/{id}` → `requiredActions: ["VERIFY_PHONE_NUMBER"]`
+
+## Next
+
+→ [Themes & Branding](./themes)

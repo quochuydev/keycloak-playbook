@@ -1,0 +1,79 @@
+---
+title: Introduction
+description: What Keycloak gives us and how it maps onto our product
+---
+
+## Why Keycloak
+
+Keycloak handles the three hard parts of identity for us:
+
+1. **Authentication** — login forms, social IdPs, MFA, email/SMS verification, password reset flows.
+2. **Authorization** — roles, groups, and fine-grained permissions delivered inside signed JWTs.
+3. **Organization / multi-tenancy** — first-class since Keycloak 26, so we don't have to build tenant isolation on top of a flat user table.
+
+Everything is exposed over standards (OIDC / OAuth 2.1 / SCIM / Admin REST), which means our Node.js gateway and Next.js apps can integrate with any well-maintained library rather than writing custom auth.
+
+## Core Concepts
+
+<Cards>
+  <Card title="Realm" description="Isolated tenant of Keycloak itself. We use one realm for the whole product: `product`." />
+  <Card title="Client" description="An application that talks to Keycloak. We register one per frontend + one for the gateway." />
+  <Card title="User" description="A person. Lives inside a realm. Can belong to one or more organizations." />
+  <Card title="Role" description="A named permission. Realm-level (e.g. `sysadmin`) or client-level (e.g. `app:billing.read`)." />
+  <Card title="Group" description="A bag of users that share role mappings. We barely use groups — organizations replace most use cases." />
+  <Card title="Organization" description="A tenant inside the realm. Has members, invitations, domains, and its own identity providers." />
+</Cards>
+
+## Clients We Register
+
+| Client ID | Type | Used by | Access type |
+| --- | --- | --- | --- |
+| `gateway` | confidential | Node.js backend | `bearer-only` — validates tokens, never initiates login |
+| `frontend-sysadmin` | public | SysAdmin Next.js app | `authorization_code + PKCE` |
+| `frontend-admin` | public | Admin (org owner) Next.js app | `authorization_code + PKCE` |
+| `frontend-app` | public | End-user Next.js app | `authorization_code + PKCE` |
+| `account-app` | public | Custom account UI | `authorization_code + PKCE` + Account API |
+
+## Role Model
+
+Three realm roles map directly to the three frontends:
+
+- `sysadmin` — can create/delete organizations, manage any user, see audit across tenants. Granted to internal staff only.
+- `org-owner` — scoped to the organization(s) the user belongs to. Can invite members, assign org roles, manage org settings.
+- `org-user` — default role for members. Can use the app features granted to them.
+
+Feature-level permissions live as **client roles** on `frontend-app` (e.g. `billing.read`, `billing.write`, `reports.export`) and are composed into org-level role sets.
+
+## Token Shape
+
+Every access token carries:
+
+```json
+{
+  "sub": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+  "email": "alice@acme.test",
+  "preferred_username": "alice",
+  "realm_access": { "roles": ["org-user", "offline_access"] },
+  "resource_access": {
+    "frontend-app": { "roles": ["billing.read"] }
+  },
+  "organization": {
+    "acme": {
+      "id": "b9f2c1a0-...",
+      "roles": ["org-owner"]
+    }
+  },
+  "iss": "https://iam.example.com/realms/product",
+  "aud": ["gateway", "account"],
+  "exp": 1714060800,
+  "iat": 1714060500
+}
+```
+
+The gateway authorizes a request by looking at `realm_access.roles`, `resource_access.frontend-app.roles`, and the `organization` claim for the tenant scope.
+
+## Where to Next
+
+- If you've never booted Keycloak before: [Run Keycloak Locally](./setup/local).
+- If Keycloak is already running and you need to wire an app: [Architecture & Flow](./architecture), then the relevant [Integration](./integration/gateway-nodejs) guide.
+- If you're implementing an endpoint and need the exact HTTP contract: [APIs](./apis/authentication).

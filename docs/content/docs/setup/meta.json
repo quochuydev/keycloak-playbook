@@ -1,0 +1,11 @@
+{
+  "title": "Setup",
+  "pages": [
+    "local",
+    "realm-and-clients",
+    "roles-and-groups",
+    "organizations",
+    "email-and-sms",
+    "themes"
+  ]
+}

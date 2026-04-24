@@ -1,0 +1,208 @@
+---
+title: Next.js Frontends
+description: Configure Auth.js (NextAuth v5) with the Keycloak provider for SysAdmin, Admin, and App
+---
+
+All three product frontends share the same recipe. Only the client ID, role gates, and redirect URIs differ.
+
+## Install
+
+```bash
+pnpm add next-auth@beta jose
+```
+
+(`next-auth@beta` is Auth.js v5.)
+
+## Env (per frontend)
+
+```
+AUTH_SECRET=<openssl rand -hex 32>
+AUTH_URL=https://app.example.com            # this frontend's origin
+AUTH_KEYCLOAK_ID=frontend-app
+AUTH_KEYCLOAK_ISSUER=https://iam.example.com/realms/product
+GATEWAY_URL=https://api.example.com
+```
+
+Public clients don't need a secret. If you insist on confidential clients, add `AUTH_KEYCLOAK_SECRET`.
+
+## `auth.ts`
+
+```ts
+// auth.ts
+import NextAuth from 'next-auth'
+import Keycloak from 'next-auth/providers/keycloak'
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [
+    Keycloak({
+      clientId: process.env.AUTH_KEYCLOAK_ID!,
+      issuer: process.env.AUTH_KEYCLOAK_ISSUER!,
+      authorization: { params: { scope: 'openid profile email organization offline_access' } },
+    }),
+  ],
+  session: { strategy: 'jwt', maxAge: 60 * 60 * 10 },
+  callbacks: {
+    async jwt({ token, account }) {
+      // First sign-in: copy tokens into the cookie
+      if (account) {
+        token.accessToken = account.access_token
+        token.refreshToken = account.refresh_token
+        token.accessTokenExpires = Date.now() + (account.expires_in as number) * 1000
+      }
+      // Still valid?
+      if (Date.now() < (token.accessTokenExpires as number) - 30_000) return token
+      // Silent refresh
+      return await refreshAccessToken(token)
+    },
+    async session({ session, token }) {
+      session.accessToken = token.accessToken as string
+      session.error = (token.error as string) ?? null
+      session.user = decodeUser(token.accessToken as string)
+      return session
+    },
+  },
+})
+
+async function refreshAccessToken(token: any) {
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: process.env.AUTH_KEYCLOAK_ID!,
+      refresh_token: token.refreshToken,
+    })
+    const res = await fetch(
+      `${process.env.AUTH_KEYCLOAK_ISSUER}/protocol/openid-connect/token`,
+      { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
+    )
+    const json = await res.json()
+    if (!res.ok) throw json
+    return {
+      ...token,
+      accessToken: json.access_token,
+      refreshToken: json.refresh_token ?? token.refreshToken,
+      accessTokenExpires: Date.now() + json.expires_in * 1000,
+      error: null,
+    }
+  } catch (err) {
+    return { ...token, error: 'RefreshAccessTokenError' }
+  }
+}
+
+function decodeUser(jwt: string) {
+  const [, payload] = jwt.split('.')
+  return JSON.parse(Buffer.from(payload, 'base64url').toString())
+}
+```
+
+## Route Handler + Middleware
+
+```ts
+// app/api/auth/[...nextauth]/route.ts
+export { GET, POST } from '@/auth'
+
+// middleware.ts
+import { auth } from './auth'
+export default auth((req) => {
+  const isAuthPage = req.nextUrl.pathname.startsWith('/auth')
+  if (!req.auth && !isAuthPage) {
+    const url = new URL('/api/auth/signin', req.url)
+    url.searchParams.set('callbackUrl', req.nextUrl.href)
+    return Response.redirect(url)
+  }
+})
+export const config = { matcher: ['/((?!_next|favicon.ico|public).*)'] }
+```
+
+## Server-Side Role Check
+
+```tsx
+// app/admin/page.tsx
+import { auth } from '@/auth'
+import { redirect } from 'next/navigation'
+
+export default async function AdminPage() {
+  const session = await auth()
+  const roles = session?.user?.realm_access?.roles ?? []
+  if (!roles.includes('org-owner')) redirect('/')
+  return <OrgDashboard />
+}
+```
+
+Same pattern per frontend:
+
+| Frontend | Required realm role |
+| --- | --- |
+| `frontend-sysadmin` | `sysadmin` |
+| `frontend-admin` | `org-owner` |
+| `frontend-app` | `org-user` (effectively everyone) |
+
+## Calling the Gateway
+
+```ts
+// lib/api.ts
+import { auth } from '@/auth'
+
+export async function api(path: string, init: RequestInit = {}) {
+  const session = await auth()
+  if (!session?.accessToken) throw new Error('unauthenticated')
+  return fetch(`${process.env.GATEWAY_URL}${path}`, {
+    ...init,
+    headers: {
+      ...init.headers,
+      Authorization: `Bearer ${session.accessToken}`,
+      'X-Org-Alias': session.user.activeOrg ?? '',
+    },
+  })
+}
+```
+
+Use it from server components / route handlers:
+
+```ts
+const res = await api('/orgs/me')
+const { organizations } = await res.json()
+```
+
+## Sign-Out
+
+```tsx
+'use client'
+import { signOut } from 'next-auth/react'
+
+export function LogoutButton() {
+  return <button onClick={() => signOut({ callbackUrl: '/' })}>Sign out</button>
+}
+```
+
+Auth.js's Keycloak provider supports RP-initiated logout. To also end the Keycloak SSO session, override the sign-out callback URL:
+
+```ts
+// auth.ts
+events: {
+  async signOut(message) {
+    if ('token' in message) {
+      const idToken = message.token.idToken as string | undefined
+      if (!idToken) return
+      const url = new URL(`${process.env.AUTH_KEYCLOAK_ISSUER}/protocol/openid-connect/logout`)
+      url.searchParams.set('id_token_hint', idToken)
+      url.searchParams.set('post_logout_redirect_uri', process.env.AUTH_URL!)
+      await fetch(url) // best-effort, fire-and-forget
+    }
+  },
+},
+```
+
+## Silent SSO Across the Three Frontends
+
+Because all three use the same realm and share Keycloak's SSO cookie on `iam.example.com`, a user who logs into `admin.example.com` will land on `app.example.com` already authenticated. Auth.js handles this automatically via `prompt=none` on the second redirect — Keycloak responds with a new code immediately without showing the login form.
+
+## Active Org Switching
+
+The access token lists all org memberships; the frontend tracks the "current" one in a small cookie (`active_org=acme`). When the user switches, refresh the cookie and set the `X-Org-Alias` header on subsequent calls. The gateway verifies the header against `token.organization`.
+
+## Pitfalls
+
+- **Missing `offline_access` scope.** Without it refresh tokens are session-bound and die when the browser closes. With it they survive but introduce risk — use only if you need background refresh.
+- **Clock skew on token expiry.** Refresh 30s before `exp`, not at `exp`, to avoid 401 races.
+- **Cookie size.** The `next-auth` JWT can approach the 4 KB cookie limit with fat role claims. Prefer storing only `accessToken` and decoding roles on demand.
+- **Role changes not reflected until re-login.** JWT tokens are claims at issue time. On role change, call Admin API `POST /users/{id}/logout` or wait for refresh.

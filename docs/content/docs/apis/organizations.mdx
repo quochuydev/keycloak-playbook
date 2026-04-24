@@ -1,0 +1,273 @@
+---
+title: Organizations APIs
+description: Create orgs, manage members, send invites — powering the SysAdmin and Admin frontends
+---
+
+All endpoints are under:
+
+```
+https://iam.example.com/admin/realms/product/organizations
+```
+
+Authorization: `Bearer <admin or service-account token>` with `view-realm` + `manage-users` + organization-management permissions.
+
+## Create an Organization
+
+Used by the **SysAdmin frontend** when onboarding a new tenant.
+
+```bash
+curl -s -X POST https://iam.example.com/admin/realms/product/organizations \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Acme Corp",
+    "alias": "acme",
+    "redirectUrl": "https://app.example.com/orgs/acme",
+    "domains": [
+      { "name": "acme.test", "verified": false }
+    ],
+    "attributes": {
+      "plan": ["enterprise"],
+      "region": ["ap-southeast-1"]
+    }
+  }'
+```
+
+**Response:** `201 Created` with `Location: /admin/realms/product/organizations/{id}`.
+
+## List Organizations
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/organizations?first=0&max=20&search=acme" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "b9f2c1a0-1234-5678-9abc-def012345678",
+    "name": "Acme Corp",
+    "alias": "acme",
+    "enabled": true,
+    "description": null,
+    "redirectUrl": "https://app.example.com/orgs/acme",
+    "domains": [
+      { "name": "acme.test", "verified": false }
+    ],
+    "attributes": {
+      "plan": ["enterprise"],
+      "region": ["ap-southeast-1"]
+    }
+  }
+]
+```
+
+## Get a Single Organization
+
+```bash
+curl -s https://iam.example.com/admin/realms/product/organizations/$ORG_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):** same shape as a list element.
+
+## Update an Organization
+
+```bash
+curl -s -X PUT https://iam.example.com/admin/realms/product/organizations/$ORG_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "b9f2c1a0-1234-5678-9abc-def012345678",
+    "name": "Acme Corporation",
+    "alias": "acme",
+    "domains": [{ "name": "acme.test", "verified": true }]
+  }'
+```
+
+**Response:** `204 No Content`.
+
+## Delete an Organization
+
+```bash
+curl -s -X DELETE https://iam.example.com/admin/realms/product/organizations/$ORG_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response:** `204`. Removes membership for all users; does **not** delete the users themselves.
+
+## List Members
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/members?first=0&max=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+    "username": "alice",
+    "email": "alice@acme.test",
+    "firstName": "Alice",
+    "lastName": "Nguyen",
+    "enabled": true,
+    "membershipType": "MANAGED"
+  },
+  {
+    "id": "f7b1c3e2-aaaa-bbbb-cccc-ddddeeeeffff",
+    "username": "bob",
+    "email": "bob@acme.test",
+    "firstName": "Bob",
+    "lastName": "Tran",
+    "enabled": true,
+    "membershipType": "UNMANAGED"
+  }
+]
+```
+
+`membershipType` is `MANAGED` when the user's lifecycle is tied to the org (deleted when removed from org), `UNMANAGED` otherwise.
+
+## Add an Existing User as Member
+
+```bash
+curl -s -X POST "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/members" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "\"$USER_ID\""
+```
+
+Note the body is a quoted JSON string (the user id), not an object.
+
+**Response:** `201 Created`.
+
+## Remove a Member
+
+```bash
+curl -s -X DELETE "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/members/$USER_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response:** `204`.
+
+## Invite a User by Email
+
+Keycloak generates a signed invitation link and sends it via email using the realm's SMTP.
+
+```bash
+curl -s -X POST "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/members/invite-user" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "email=charlie@acme.test" \
+  --data-urlencode "firstName=Charlie" \
+  --data-urlencode "lastName=Le"
+```
+
+**Response:** `204 No Content`. User receives an email; clicking registers them (if new) and adds them to the org.
+
+## Invite an Existing User
+
+```bash
+curl -s -X POST "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/members/invite-existing-user" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "id=$USER_ID"
+```
+
+**Response:** `204`.
+
+## Org Identity Providers
+
+Bind an existing realm IdP to the org (e.g. the org's Azure AD for enterprise SSO):
+
+```bash
+curl -s -X POST "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/identity-providers" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '"acme-azure-ad"'
+```
+
+**Response:** `201`.
+
+List:
+
+```bash
+curl -s https://iam.example.com/admin/realms/product/organizations/$ORG_ID/identity-providers \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "alias": "acme-azure-ad",
+    "providerId": "oidc",
+    "displayName": "Acme Azure AD",
+    "enabled": true,
+    "config": {
+      "authorizationUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+      "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+      "clientId": "...",
+      "organizationId": "b9f2c1a0-1234-5678-9abc-def012345678"
+    }
+  }
+]
+```
+
+## Count Members
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/organizations/$ORG_ID/members/count" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Sample response (200):**
+
+```
+42
+```
+
+## Per-User: Which Orgs Am I In?
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/users/$USER_ID/organizations" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "b9f2c1a0-1234-5678-9abc-def012345678",
+    "name": "Acme Corp",
+    "alias": "acme",
+    "enabled": true
+  }
+]
+```
+
+## Error Examples
+
+**409 — alias already taken:**
+
+```json
+{ "errorMessage": "Organization with alias 'acme' already exists" }
+```
+
+**400 — invalid domain:**
+
+```json
+{ "errorMessage": "A valid domain is required" }
+```
+
+**404 — unknown org:**
+
+```json
+{ "error": "Organization not found" }
+```

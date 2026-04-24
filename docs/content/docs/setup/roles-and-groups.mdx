@@ -1,0 +1,98 @@
+---
+title: Roles & Groups
+description: Design the realm roles, client roles, and composite roles that back our three frontends
+---
+
+## Decision: Roles, Not Groups
+
+Keycloak offers both roles and groups. We use **roles only**:
+
+- Realm roles represent *what kind of user* someone is (`sysadmin`, `org-owner`, `org-user`).
+- Client roles on `frontend-app` represent *feature permissions* (`billing.read`, `reports.export`).
+- Multi-tenancy is handled by **Organizations**, not groups. A user's role in an org lives on the organization membership.
+
+Groups remain available for ad-hoc bundles (e.g. "beta users"), but should not encode tenancy.
+
+## Realm Roles
+
+**Realm settings → Realm roles → Create role**
+
+| Name | Description |
+| --- | --- |
+| `sysadmin` | Staff: cross-tenant access, can manage any org and any user |
+| `org-owner` | Can manage their organization's settings and members |
+| `org-user` | Default role for any org member |
+| `service` | Granted to service-account clients for internal calls |
+
+Mark `org-user` as a **Default Role** (Realm settings → User registration → Default roles) so every new user automatically has it.
+
+## Client Roles on `frontend-app`
+
+Feature-scoped permissions live on `frontend-app` so access tokens minted for that client naturally expose them as `resource_access["frontend-app"].roles`.
+
+**Clients → frontend-app → Roles → Create role**
+
+| Name | Purpose |
+| --- | --- |
+| `billing.read` | View invoices, subscriptions |
+| `billing.write` | Change plan, update payment method |
+| `reports.read` | View reports |
+| `reports.export` | Export report data |
+| `members.read` | See org member list |
+
+Apply the same discipline to `frontend-admin` (e.g. `manage-members`, `manage-org-settings`).
+
+## Composite Roles
+
+Composite roles bundle other roles together so user-level assignment stays tidy.
+
+Create realm-level composites:
+
+| Composite | Includes |
+| --- | --- |
+| `role:admin-bundle` | `org-owner` + `frontend-admin:manage-members` + `frontend-admin:manage-org-settings` + `frontend-app:billing.write` + `frontend-app:reports.export` |
+| `role:standard-user` | `org-user` + `frontend-app:billing.read` + `frontend-app:reports.read` |
+
+**How to create one:** Realm settings → Realm roles → `role:admin-bundle` → **Associated roles** tab → **Assign role** → pick the children.
+
+Now assigning `role:admin-bundle` to a user grants the whole set.
+
+## Assigning Roles to a User
+
+**Users → (user) → Role mapping → Assign role** → pick realm or client roles.
+
+Via CLI:
+
+```bash
+# Assign a realm role
+/opt/keycloak/bin/kcadm.sh add-roles -r product \
+  --uusername alice --rolename org-owner
+
+# Assign a client role on frontend-app
+/opt/keycloak/bin/kcadm.sh add-roles -r product \
+  --uusername alice --cclientid frontend-app --rolename billing.write
+```
+
+## How Roles Reach the Token
+
+The default client scopes `roles` and `web-origins` are attached to every client and inject two top-level claims:
+
+```json
+{
+  "realm_access": { "roles": ["org-user", "org-owner"] },
+  "resource_access": {
+    "frontend-app": { "roles": ["billing.read", "billing.write"] },
+    "account":      { "roles": ["manage-account"] }
+  }
+}
+```
+
+If you don't see the roles you expect:
+
+1. Check which client issued the token — client roles only show when that client is in `aud` or attached as a scope.
+2. Check the `scope` parameter in the `/token` call — `roles` scope must be requested (or be a default scope).
+3. Use **Clients → (client) → Client scopes → Evaluate** to preview the token a given user would receive.
+
+## Next
+
+→ [Organizations](./organizations)

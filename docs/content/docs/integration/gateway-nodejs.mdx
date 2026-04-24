@@ -1,0 +1,253 @@
+---
+title: Backend Gateway (Node.js)
+description: Verify JWTs via JWKS, enforce RBAC, and call Keycloak Admin APIs from the gateway
+---
+
+## Responsibilities Recap
+
+- Accept every inbound request with `Authorization: Bearer <access_token>`.
+- Verify signature, `exp`, `iss`, `aud` using Keycloak's JWKS (cached).
+- Enforce route-level RBAC using `realm_access.roles`, `resource_access.*`, and the `organization` claim.
+- Expose a thin wrapper over Keycloak Admin APIs so frontends never talk to Keycloak directly.
+
+## Dependencies
+
+```bash
+pnpm add jose node-cache undici
+pnpm add -D @types/node
+```
+
+- `jose` — modern JWT + JWK library, handles JWKS remote key sets.
+- `undici` — built-in fetch is fine, but `undici` gives connection pooling.
+- `node-cache` — tiny in-process TTL cache.
+
+## Env
+
+```
+KEYCLOAK_ISSUER=https://iam.example.com/realms/product
+KEYCLOAK_AUDIENCE=gateway,account
+KEYCLOAK_GATEWAY_CLIENT_ID=gateway
+KEYCLOAK_GATEWAY_SECRET=...         # confidential client secret
+```
+
+## JWT Verification Middleware
+
+```ts
+// auth/verify.ts
+import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose'
+
+const ISSUER = process.env.KEYCLOAK_ISSUER!
+const AUDIENCE = process.env.KEYCLOAK_AUDIENCE!.split(',')
+
+const JWKS = createRemoteJWKSet(new URL(`${ISSUER}/protocol/openid-connect/certs`), {
+  cooldownDuration: 30_000,
+  cacheMaxAge: 10 * 60_000,
+})
+
+export type AuthClaims = JWTPayload & {
+  sub: string
+  preferred_username?: string
+  email?: string
+  realm_access?: { roles: string[] }
+  resource_access?: Record<string, { roles: string[] }>
+  organization?: Record<string, { id: string; roles?: string[] }>
+}
+
+export async function verifyAccessToken(token: string): Promise<AuthClaims> {
+  const { payload } = await jwtVerify(token, JWKS, {
+    issuer: ISSUER,
+    audience: AUDIENCE,
+    algorithms: ['RS256'],
+    clockTolerance: 5,
+  })
+  return payload as AuthClaims
+}
+```
+
+## Express Middleware
+
+```ts
+// auth/middleware.ts
+import type { Request, Response, NextFunction } from 'express'
+import { verifyAccessToken, AuthClaims } from './verify'
+
+declare module 'express-serve-static-core' {
+  interface Request { auth?: AuthClaims }
+}
+
+export async function authenticate(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization
+  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'missing_token' })
+  try {
+    req.auth = await verifyAccessToken(header.slice(7))
+    next()
+  } catch (err) {
+    return res.status(401).json({ error: 'invalid_token', detail: (err as Error).message })
+  }
+}
+
+export function requireRealmRole(...roles: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const have = new Set(req.auth?.realm_access?.roles ?? [])
+    if (!roles.every(r => have.has(r))) return res.status(403).json({ error: 'forbidden' })
+    next()
+  }
+}
+
+export function requireClientRole(client: string, ...roles: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const have = new Set(req.auth?.resource_access?.[client]?.roles ?? [])
+    if (!roles.every(r => have.has(r))) return res.status(403).json({ error: 'forbidden' })
+    next()
+  }
+}
+
+export function requireOrgRole(orgParam = 'org', ...roles: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const alias = req.params[orgParam] ?? req.header('X-Org-Alias')
+    const membership = alias ? req.auth?.organization?.[alias] : undefined
+    if (!membership) return res.status(403).json({ error: 'not_org_member' })
+    const have = new Set(membership.roles ?? [])
+    if (roles.length && !roles.every(r => have.has(r))) return res.status(403).json({ error: 'forbidden' })
+    next()
+  }
+}
+```
+
+## Wiring Routes
+
+```ts
+// routes/orgs.ts
+import { Router } from 'express'
+import { authenticate, requireRealmRole, requireOrgRole } from '../auth/middleware'
+
+const r = Router()
+
+// Any authenticated user can see their own memberships
+r.get('/orgs/me', authenticate, (req, res) => {
+  res.json({ organizations: req.auth?.organization ?? {} })
+})
+
+// Only sysadmins can list every org
+r.get('/orgs', authenticate, requireRealmRole('sysadmin'), async (req, res) => {
+  const list = await kcAdmin.listOrganizations()
+  res.json(list)
+})
+
+// Only org-owners of a given org can invite members
+r.post('/orgs/:org/members',
+  authenticate,
+  requireOrgRole('org', 'org-owner'),
+  async (req, res) => {
+    await kcAdmin.inviteUser(req.params.org, req.body.email)
+    res.status(204).end()
+  })
+
+export default r
+```
+
+## Service-Account Admin Client
+
+Wrap the Admin API with a token cache:
+
+```ts
+// auth/kc-admin.ts
+import { fetch } from 'undici'
+import NodeCache from 'node-cache'
+
+const ISSUER = process.env.KEYCLOAK_ISSUER!
+const CID = process.env.KEYCLOAK_GATEWAY_CLIENT_ID!
+const CSECRET = process.env.KEYCLOAK_GATEWAY_SECRET!
+const cache = new NodeCache()
+
+async function getServiceToken(): Promise<string> {
+  const cached = cache.get<string>('svc_token')
+  if (cached) return cached
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: CID,
+    client_secret: CSECRET,
+  })
+  const res = await fetch(`${ISSUER}/protocol/openid-connect/token`, { method: 'POST', body })
+  if (!res.ok) throw new Error(`kc token ${res.status}`)
+  const json: any = await res.json()
+  cache.set('svc_token', json.access_token, Math.max(10, json.expires_in - 30))
+  return json.access_token
+}
+
+export const kcAdmin = {
+  async listOrganizations() {
+    const token = await getServiceToken()
+    const res = await fetch(`${ISSUER.replace('/realms/', '/admin/realms/')}/organizations`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!res.ok) throw new Error(`listOrganizations ${res.status}`)
+    return res.json()
+  },
+  async inviteUser(orgAlias: string, email: string) {
+    const token = await getServiceToken()
+    const org = await this.findOrgByAlias(orgAlias)
+    const body = new URLSearchParams({ email })
+    const res = await fetch(
+      `${ISSUER.replace('/realms/', '/admin/realms/')}/organizations/${org.id}/members/invite-user`,
+      { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body },
+    )
+    if (!res.ok) throw new Error(`inviteUser ${res.status}`)
+  },
+  async findOrgByAlias(alias: string) {
+    const token = await getServiceToken()
+    const res = await fetch(
+      `${ISSUER.replace('/realms/', '/admin/realms/')}/organizations?search=${encodeURIComponent(alias)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    const list = (await res.json()) as { alias: string; id: string }[]
+    const hit = list.find(o => o.alias === alias)
+    if (!hit) throw new Error(`org ${alias} not found`)
+    return hit
+  },
+}
+```
+
+## Propagating Identity to Internal Services
+
+Add a short-lived, gateway-signed header that downstream services trust without re-validating Keycloak tokens:
+
+```ts
+import { SignJWT } from 'jose'
+
+async function mintInternalIdentity(claims: AuthClaims) {
+  return await new SignJWT({
+    sub: claims.sub,
+    username: claims.preferred_username,
+    email: claims.email,
+    realm_roles: claims.realm_access?.roles ?? [],
+    organizations: Object.keys(claims.organization ?? {}),
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuer('gateway')
+    .setAudience('internal')
+    .setExpirationTime('60s')
+    .sign(INTERNAL_SIGNING_KEY)
+}
+```
+
+Proxy middleware:
+
+```ts
+app.use('/api/billing', authenticate, async (req, res, next) => {
+  req.headers['x-identity'] = await mintInternalIdentity(req.auth!)
+  proxy(BILLING_URL)(req, res, next)
+})
+```
+
+## Health / Readiness
+
+- Gateway **readiness** = JWKS reachable + first service-account token mint succeeds.
+- On JWKS fetch failure, keep serving with the cached keys until they age out (`jose` does this by default via `cooldownDuration`).
+
+## Pitfalls
+
+- **`audience` mismatch.** By default Keycloak only puts the client that requested the token in `aud`. Add an **Audience** protocol mapper on the `frontend-app` client scope that adds `gateway` to the audience, otherwise the gateway will reject every frontend token.
+- **Clock skew.** Keep `clockTolerance: 5` — a few seconds of drift is normal in containers.
+- **Logging.** Never log the raw access token. Log `sub` and `jti` instead.
+- **Caching JWKS too aggressively.** 10 minutes is a good default. Keycloak key rotation will fail silently for anyone caching for hours.

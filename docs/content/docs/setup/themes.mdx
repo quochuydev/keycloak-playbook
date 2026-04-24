@@ -1,0 +1,83 @@
+---
+title: Themes & Branding
+description: Point the built-in login pages at our brand, or skip them entirely via the Account App
+---
+
+## Two Strategies
+
+1. **Theme the built-in login** — minimal effort, works for email verify / password reset / consent screens we can't easily replace.
+2. **Replace the login UI with the Account App** — the Account App implements our own login form and calls Keycloak's `/token` endpoint directly (Direct Grant) for username/password, and redirects to Keycloak for MFA/social login.
+
+We do **both**: the Account App owns the primary login form, but Keycloak's built-in pages still serve less-common flows (invitation acceptance, consent, IdP linking, email verification).
+
+## Theming Setup
+
+### Folder Layout
+
+```
+themes/
+└── product/
+    ├── login/
+    │   ├── theme.properties
+    │   ├── login.ftl            # override as needed
+    │   ├── resources/
+    │   │   ├── css/
+    │   │   │   └── product.css
+    │   │   └── img/
+    │   │       └── logo.svg
+    │   └── messages/
+    │       └── messages_en.properties
+    ├── email/
+    │   ├── theme.properties
+    │   ├── html/…
+    │   └── text/…
+    └── account/
+        └── theme.properties     # we default to `keycloak.v3` here
+```
+
+### theme.properties (login)
+
+```properties
+parent=keycloak.v2
+import=common/keycloak
+styles=css/login.css css/product.css
+meta=viewport==width=device-width,initial-scale=1
+```
+
+### Mounting in Docker
+
+```yaml
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    volumes:
+      - ./themes:/opt/keycloak/themes
+    environment:
+      KC_SPI_THEME_STATIC_MAX_AGE: 2592000
+      KC_SPI_THEME_CACHE_THEMES: "true"
+      KC_SPI_THEME_CACHE_TEMPLATES: "true"
+```
+
+Select it: **Realm settings → Themes → Login Theme → `product`** and **Email Theme → `product`**.
+
+## Localization
+
+Add `messages_vi.properties`, `messages_ja.properties`, etc. Enable internationalization: **Realm settings → Localization → Internationalization Enabled**.
+
+## Hot Reload in Development
+
+In `start-dev` mode theme caching is off, so file edits appear on page refresh. For `start` mode turn caching off explicitly:
+
+```yaml
+KC_SPI_THEME_CACHE_THEMES: "false"
+KC_SPI_THEME_CACHE_TEMPLATES: "false"
+KC_SPI_THEME_STATIC_MAX_AGE: 0
+```
+
+## Keeping the Account App in Charge
+
+Because we **don't** use Keycloak's built-in Account Console, there's no need to theme it. We still set its theme to `keycloak.v3` (the current default) to avoid the deprecation notice on the admin console.
+
+## Next
+
+→ [Authentication APIs](../apis/authentication)

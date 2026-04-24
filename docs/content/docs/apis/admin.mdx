@@ -1,0 +1,319 @@
+---
+title: Admin APIs
+description: Realm-wide admin operations — users, roles, role mappings, sessions
+---
+
+Base: `https://iam.example.com/admin/realms/product`
+
+Authorization: `Bearer <admin or service-account token>`. The token's client must have the required `realm-management` roles:
+
+| Operation | Required role |
+| --- | --- |
+| Read users | `view-users` |
+| Mutate users | `manage-users` |
+| Read roles | `view-realm` |
+| Mutate realm roles | `manage-realm` |
+| Read events | `view-events` |
+
+## Search Users
+
+```bash
+# Text search against username/first/last/email
+curl -s "https://iam.example.com/admin/realms/product/users?search=alice&first=0&max=20" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+
+# Exact email match
+curl -s "https://iam.example.com/admin/realms/product/users?email=alice@acme.test&exact=true" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+
+# Custom attribute — e.g. employee_id
+curl -s "https://iam.example.com/admin/realms/product/users?q=employee_id:12345" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):** array of user representations (see [User Management](./user-management#admin-side-user-read)).
+
+## Count Users
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/users/count" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Sample response (200):**
+
+```
+1247
+```
+
+## Realm Roles — CRUD
+
+### List
+
+```bash
+curl -s https://iam.example.com/admin/realms/product/roles \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "a1b2c3d4-...",
+    "name": "org-owner",
+    "description": "Can manage their organization",
+    "composite": false,
+    "clientRole": false,
+    "containerId": "product"
+  },
+  {
+    "id": "e5f6a7b8-...",
+    "name": "sysadmin",
+    "description": "Cross-tenant staff",
+    "composite": true,
+    "clientRole": false,
+    "containerId": "product"
+  }
+]
+```
+
+### Create
+
+```bash
+curl -s -X POST https://iam.example.com/admin/realms/product/roles \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "beta-tester", "description": "Early access to beta features" }'
+```
+
+**Response:** `201 Created`.
+
+### Delete
+
+```bash
+curl -s -X DELETE https://iam.example.com/admin/realms/product/roles/beta-tester \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response:** `204`.
+
+## Role Mappings — Assign to User
+
+```bash
+# First, look up the role representation
+ROLE=$(curl -s https://iam.example.com/admin/realms/product/roles/org-owner \
+  -H "Authorization: Bearer $ADMIN_TOKEN")
+
+# Then assign
+curl -s -X POST "https://iam.example.com/admin/realms/product/users/$USER_ID/role-mappings/realm" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[$ROLE]"
+```
+
+**Response:** `204`.
+
+### Remove
+
+```bash
+curl -s -X DELETE "https://iam.example.com/admin/realms/product/users/$USER_ID/role-mappings/realm" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[$ROLE]"
+```
+
+### List a User's Effective Roles
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/users/$USER_ID/role-mappings/realm/composite" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  { "name": "org-user",  "composite": false, "clientRole": false },
+  { "name": "org-owner", "composite": false, "clientRole": false },
+  { "name": "offline_access", "composite": false, "clientRole": false }
+]
+```
+
+## Client Roles — Assign
+
+```bash
+# Find the client's internal id
+CID=$(curl -s "https://iam.example.com/admin/realms/product/clients?clientId=frontend-app" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
+
+# Find the role
+ROLE=$(curl -s "https://iam.example.com/admin/realms/product/clients/$CID/roles/billing.write" \
+  -H "Authorization: Bearer $ADMIN_TOKEN")
+
+# Assign
+curl -s -X POST "https://iam.example.com/admin/realms/product/users/$USER_ID/role-mappings/clients/$CID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[$ROLE]"
+```
+
+**Response:** `204`.
+
+## Sessions
+
+### List a User's Active Sessions
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/users/$USER_ID/sessions" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "id": "c7f6e2a1-5555-4444-aaaa-bbbbccccdddd",
+    "username": "alice",
+    "userId": "c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+    "ipAddress": "203.0.113.7",
+    "start": 1714058000000,
+    "lastAccess": 1714060500000,
+    "rememberMe": false,
+    "clients": {
+      "frontend-app": "frontend-app",
+      "account-app": "account-app"
+    }
+  }
+]
+```
+
+### Log User Out Everywhere
+
+```bash
+curl -s -X POST "https://iam.example.com/admin/realms/product/users/$USER_ID/logout" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response:** `204`. All SSO sessions for this user are killed across all clients.
+
+### Revoke a Specific Session
+
+```bash
+curl -s -X DELETE "https://iam.example.com/admin/realms/product/sessions/$SESSION_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Response:** `204`.
+
+## Events (audit log)
+
+Enable first: **Realm settings → Events → User events settings → Save events**.
+
+### Login / User Events
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/events?type=LOGIN&type=LOGIN_ERROR&first=0&max=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "time": 1714060500000,
+    "type": "LOGIN",
+    "realmId": "product",
+    "clientId": "frontend-app",
+    "userId": "c2a8d4b6-...",
+    "ipAddress": "203.0.113.7",
+    "details": {
+      "auth_method": "openid-connect",
+      "auth_type": "code",
+      "response_type": "code",
+      "redirect_uri": "https://app.example.com/api/auth/callback/keycloak",
+      "consent": "no_consent_required",
+      "code_id": "b1c2d3e4-...",
+      "username": "alice"
+    }
+  },
+  {
+    "time": 1714059000000,
+    "type": "LOGIN_ERROR",
+    "realmId": "product",
+    "clientId": "frontend-app",
+    "ipAddress": "203.0.113.9",
+    "error": "invalid_user_credentials",
+    "details": {
+      "username": "mallory",
+      "auth_method": "openid-connect"
+    }
+  }
+]
+```
+
+### Admin Events
+
+```bash
+curl -s "https://iam.example.com/admin/realms/product/admin-events?authUser=$ADMIN_ID&first=0&max=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  {
+    "time": 1714060800000,
+    "realmId": "product",
+    "authDetails": {
+      "realmId": "product",
+      "clientId": "gateway",
+      "userId": "svc-...",
+      "ipAddress": "10.0.1.42"
+    },
+    "operationType": "CREATE",
+    "resourceType": "USER",
+    "resourcePath": "users/c2a8d4b6-8a4a-4f6e-9a7c-1b2d3e4f5a6b",
+    "representation": "{\"username\":\"alice\",\"enabled\":true,...}"
+  }
+]
+```
+
+## Required Actions — Global
+
+```bash
+curl -s https://iam.example.com/admin/realms/product/authentication/required-actions \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
+```
+
+**Sample response (200):**
+
+```json
+[
+  { "alias": "VERIFY_EMAIL", "name": "Verify Email",  "enabled": true,  "defaultAction": false, "priority": 10 },
+  { "alias": "UPDATE_PASSWORD", "name": "Update Password", "enabled": true, "defaultAction": false, "priority": 30 },
+  { "alias": "CONFIGURE_TOTP",  "name": "Configure OTP",   "enabled": true, "defaultAction": false, "priority": 20 },
+  { "alias": "VERIFY_PROFILE",  "name": "Verify Profile",  "enabled": true, "defaultAction": true,  "priority": 90 }
+]
+```
+
+## Impersonation (sparingly!)
+
+```bash
+curl -s -X POST "https://iam.example.com/admin/realms/product/users/$USER_ID/impersonation" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Sample response (200):**
+
+```json
+{
+  "redirect": "https://iam.example.com/realms/product/account",
+  "sameRealm": true
+}
+```
+
+Requires the `impersonation` role, emits an audit event, and must be off-limits by default for regular admins.

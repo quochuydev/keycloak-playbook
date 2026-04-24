@@ -1,0 +1,10 @@
+{
+  "title": "APIs",
+  "pages": [
+    "authentication",
+    "user-management",
+    "verification",
+    "organizations",
+    "admin"
+  ]
+}

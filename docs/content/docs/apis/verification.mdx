@@ -1,0 +1,191 @@
+---
+title: Verification APIs
+description: Trigger email verification and drive the SMS OTP flow
+---
+
+## Email
+
+### Send Verify Email (Admin API)
+
+Called by the gateway on behalf of the Account App after a user signs up or changes their email.
+
+```bash
+curl -s -X PUT "https://iam.example.com/admin/realms/product/users/$USER_ID/send-verify-email" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json"
+```
+
+**Response:** `204 No Content`. Keycloak sends the email using the realm's SMTP settings.
+
+**Optional query params:**
+
+| Param | Purpose | Example |
+| --- | --- | --- |
+| `client_id` | Theme/branding context for the email | `frontend-app` |
+| `redirect_uri` | Where the user lands after clicking the link | `https://app.example.com/verified` |
+| `lifespan` | Override link TTL (seconds) | `86400` |
+
+### Force Verification on Next Login
+
+Add `VERIFY_EMAIL` as a required action:
+
+```bash
+curl -s -X PUT https://iam.example.com/admin/realms/product/users/$USER_ID \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "requiredActions": ["VERIFY_EMAIL"] }'
+```
+
+**Response:** `204`.
+
+### Execute Actions Email (multi-action in one link)
+
+```bash
+curl -s -X PUT "https://iam.example.com/admin/realms/product/users/$USER_ID/execute-actions-email?lifespan=43200&redirect_uri=https://app.example.com/welcome&client_id=frontend-app" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '["VERIFY_EMAIL","UPDATE_PASSWORD","CONFIGURE_TOTP"]'
+```
+
+**Response:** `204`. The user gets one email with a single link that walks them through all three actions.
+
+## SMS (via our custom SPI)
+
+Keycloak has no built-in SMS endpoint, so the Account App talks to endpoints our SMS SPI exposes under the realm.
+
+### Start SMS Verification
+
+```bash
+curl -s -X POST "https://iam.example.com/realms/product/sms/send" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "phoneNumber": "+84900000000" }'
+```
+
+**Sample response (200):**
+
+```json
+{
+  "verificationId": "vf_01HZ5T8RQB9M3F6XYZ",
+  "expiresIn": 300,
+  "resendAvailableIn": 60,
+  "maskedPhoneNumber": "+849*****000"
+}
+```
+
+**Sample error (429 — throttled):**
+
+```json
+{
+  "error": "too_many_requests",
+  "error_description": "Please wait 45s before requesting another code",
+  "retryAfter": 45
+}
+```
+
+### Confirm SMS Code
+
+```bash
+curl -s -X POST "https://iam.example.com/realms/product/sms/verify" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "verificationId": "vf_01HZ5T8RQB9M3F6XYZ",
+    "code": "438210"
+  }'
+```
+
+**Sample response (200):**
+
+```json
+{
+  "verified": true,
+  "phoneNumber": "+84900000000",
+  "verifiedAt": "2026-04-24T08:33:12Z"
+}
+```
+
+Behind the scenes our SPI sets the user attributes:
+
+```
+phone_number = "+84900000000"
+phone_number_verified = "true"
+phone_number_verified_at = "2026-04-24T08:33:12Z"
+```
+
+These flow into the access token because we add them to the `profile` client scope as a user-attribute mapper.
+
+**Sample error (400 — wrong code):**
+
+```json
+{
+  "error": "invalid_code",
+  "error_description": "Code is incorrect",
+  "attemptsRemaining": 2
+}
+```
+
+**Sample error (410 — expired):**
+
+```json
+{
+  "error": "code_expired",
+  "error_description": "Code has expired, request a new one"
+}
+```
+
+### Resend
+
+```bash
+curl -s -X POST "https://iam.example.com/realms/product/sms/resend" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "verificationId": "vf_01HZ5T8RQB9M3F6XYZ" }'
+```
+
+**Sample response (200):**
+
+```json
+{
+  "verificationId": "vf_01HZ5T8RQB9M3F6XYZ",
+  "expiresIn": 300,
+  "resendAvailableIn": 60
+}
+```
+
+## End-to-End: Email Verify Flow
+
+<Steps>
+<Step>
+Account App creates the user via `POST /admin/realms/product/users` (through the gateway).
+</Step>
+<Step>
+Account App calls `PUT /admin/realms/product/users/{id}/send-verify-email?redirect_uri=...&client_id=account-app`.
+</Step>
+<Step>
+User receives email, clicks link, lands on Keycloak's confirmation page, which auto-redirects to `redirect_uri` on success.
+</Step>
+<Step>
+Account App re-reads the profile via `GET /realms/product/account` and now sees `emailVerified: true`.
+</Step>
+</Steps>
+
+## End-to-End: SMS Verify Flow
+
+<Steps>
+<Step>
+User enters their phone number in the Account App's Security page.
+</Step>
+<Step>
+Account App calls `POST /realms/product/sms/send`. SPI generates a 6-digit code, stores `{verificationId, hashedCode, expiresAt}` in the realm's cache, sends the SMS via Twilio.
+</Step>
+<Step>
+User types the code. Account App calls `POST /realms/product/sms/verify`.
+</Step>
+<Step>
+On success, SPI sets the `phone_number` + `phone_number_verified` user attributes. Next access token carries these.
+</Step>
+<Step>
+User must re-login or call refresh to pick up the new claims.
+</Step>
+</Steps>

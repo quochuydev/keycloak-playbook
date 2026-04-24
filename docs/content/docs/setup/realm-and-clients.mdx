@@ -1,0 +1,120 @@
+---
+title: Realm & Clients
+description: Create the `product` realm and register the gateway, frontends, and account app
+---
+
+## Create the Realm
+
+**Admin Console → top-left realm switcher → Create Realm**
+
+| Field | Value |
+| --- | --- |
+| Realm name | `product` |
+| Enabled | On |
+
+Then open **Realm settings → General**:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Display name | *Your Product* | Shown on login page |
+| Frontend URL | `https://iam.example.com` | Forces external URL in tokens |
+| Require SSL | `external requests` | Localhost allowed over HTTP |
+
+**Realm settings → Tokens** — sensible defaults for our stack:
+
+| Setting | Value |
+| --- | --- |
+| Access Token Lifespan | `5 minutes` |
+| Client Session Idle | `30 minutes` |
+| Client Session Max | `10 hours` |
+| SSO Session Idle | `30 minutes` |
+| SSO Session Max | `10 hours` |
+| Refresh Token Max Reuse | `0` (rotate on every refresh) |
+
+## Clients Overview
+
+| Client ID | Access Type | Standard Flow | Service Accounts | Used by |
+| --- | --- | --- | --- | --- |
+| `gateway` | confidential | off | **on** | Node.js backend |
+| `frontend-sysadmin` | public | on | off | SysAdmin Next.js |
+| `frontend-admin` | public | on | off | Admin Next.js |
+| `frontend-app` | public | on | off | App Next.js |
+| `account-app` | public | on | off | Custom account UI |
+
+## 1. `gateway` (Backend / Resource Server)
+
+**Clients → Create client**
+
+- **Client type**: OpenID Connect
+- **Client ID**: `gateway`
+- **Always display in console**: off
+
+Next page:
+
+- **Client authentication**: **On** (confidential)
+- **Authorization**: off (we do RBAC with realm roles)
+- **Authentication flow**: uncheck Standard flow, Direct access grants. **Check Service accounts roles** (needed for the gateway to call Admin API on behalf of the system).
+
+Leave Valid redirect URIs empty.
+
+After creating, open **Credentials** tab and copy the **Client Secret** — store it in the gateway's env as `KEYCLOAK_GATEWAY_SECRET`.
+
+**Service Account Roles** tab:
+- Assign `realm-management` roles: `view-users`, `manage-users`, `view-realm`, `query-users`, `query-groups`, `view-clients` — only what you actually need.
+
+## 2. `frontend-sysadmin`, `frontend-admin`, `frontend-app`
+
+Repeat three times, once per frontend. Substitute the hostname.
+
+- **Client type**: OpenID Connect
+- **Client ID**: `frontend-sysadmin` (then `frontend-admin`, `frontend-app`)
+- **Client authentication**: **Off** (public — browser SPA/BFF)
+- **Authentication flow**: Standard flow ✅, Direct access grants ❌
+- **Valid redirect URIs**:
+  - `https://sysadmin.example.com/api/auth/callback/keycloak`
+  - `http://localhost:3001/api/auth/callback/keycloak`
+- **Valid post logout redirect URIs**: same origins + `/logout`
+- **Web origins**: `+` (reflects Valid redirect URIs)
+- **Root URL** / **Home URL**: frontend origin
+- **Advanced → Proof Key for Code Exchange Code Challenge Method**: `S256` (required)
+
+## 3. `account-app`
+
+Same as a frontend client **plus**:
+
+- Under **Client scopes**, make sure `account` is attached (default) so the Account API is reachable with its tokens.
+- Add the dedicated `manage-account` role on the `account` client to its default scope.
+
+## Client Scopes
+
+Create a realm-level optional client scope **`organization`** with a protocol mapper that flattens the user's organization memberships into the token:
+
+1. **Client scopes → Create** → `organization`, protocol `openid-connect`, include in token scope **on**
+2. **Mappers → Add mapper → By configuration → User Attribute** (or use Keycloak 26's built-in organization mapper):
+   - Name: `organization`
+   - Token Claim Name: `organization`
+   - Claim JSON Type: `JSON`
+   - Add to access token: on, ID token: on, userinfo: on
+
+Then **Clients → frontend-app → Client scopes → Add client scope** → `organization` as **Default**. Repeat for `frontend-admin`, `gateway`.
+
+<Callout type="info">
+Keycloak 26 ships a built-in `organization` scope when the Organizations feature is enabled. Use that instead of rolling your own mapper when available — see [Organizations](./organizations).
+</Callout>
+
+## Verify
+
+From a shell:
+
+```bash
+curl -s -X POST https://iam.example.com/realms/product/protocol/openid-connect/token \
+  -d "grant_type=client_credentials" \
+  -d "client_id=gateway" \
+  -d "client_secret=$KEYCLOAK_GATEWAY_SECRET" | jq .
+```
+
+You should get back an `access_token`. Decoding it at [jwt.io](https://jwt.io) should show `iss=https://iam.example.com/realms/product` and the service-account roles you assigned.
+
+## Next
+
+→ [Roles & Groups](./roles-and-groups)

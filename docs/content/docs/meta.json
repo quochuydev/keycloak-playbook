@@ -1,0 +1,13 @@
+{
+  "title": "Keycloak Integration",
+  "pages": [
+    "index",
+    "architecture",
+    "---Setup---",
+    "setup",
+    "---APIs---",
+    "apis",
+    "---Integration---",
+    "integration"
+  ]
+}

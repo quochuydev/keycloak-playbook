@@ -1,0 +1,72 @@
+---
+title: Run Keycloak Locally
+description: Boot Keycloak + Postgres with docker compose and log in to the admin console
+---
+
+## Prerequisites
+
+- Docker Desktop or Docker Engine 24+
+- 2 GB of free RAM
+- Ports `8080` and `5432` available on localhost
+
+## Start the Stack
+
+From the repository root:
+
+```bash
+docker compose up -d
+docker compose logs -f keycloak
+```
+
+Wait until you see `Keycloak ... started in Xms. Listening on: http://0.0.0.0:8080`.
+
+The provided `docker-compose.yml` in the repo root starts:
+
+- **postgres** — persistent data for Keycloak
+- **keycloak** — running in `start-dev` mode (HTTP only, no TLS, ideal for local)
+
+<Callout type="warn">
+`start-dev` is **local only**. For any shared environment use `start` with TLS, a real hostname, and `KC_PROXY_HEADERS=xforwarded`.
+</Callout>
+
+## First Admin Login
+
+1. Open http://localhost:8080
+2. Click **Administration Console**
+3. Log in with `admin` / `admin`
+4. Rotate the password immediately under *Users → admin → Credentials*
+
+## Persisting Data
+
+The compose file mounts `postgres_data` as a named volume, so `docker compose down` keeps your realm. Use `docker compose down -v` only when you want a clean slate.
+
+## Useful CLI Shortcuts
+
+```bash
+# Get an admin token (for scripting)
+curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \
+  -d "grant_type=password" \
+  -d "client_id=admin-cli" \
+  -d "username=admin" \
+  -d "password=admin" | jq -r .access_token
+
+# Enter the Keycloak container for kcadm.sh / kc.sh access
+docker compose exec keycloak bash
+/opt/keycloak/bin/kcadm.sh config credentials \
+  --server http://localhost:8080 \
+  --realm master --user admin --password admin
+```
+
+## Health & Metrics
+
+With `KC_HEALTH_ENABLED=true` and `KC_METRICS_ENABLED=true` in the compose file:
+
+- Liveness: `GET http://localhost:9000/health/live`
+- Readiness: `GET http://localhost:9000/health/ready`
+- Metrics: `GET http://localhost:9000/metrics`
+
+(Management endpoints listen on `9000` by default in Keycloak 26. Expose the port in compose if you need them from the host.)
+
+## Next
+
+→ [Create the realm and clients](./realm-and-clients)

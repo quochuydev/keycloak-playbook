@@ -1,0 +1,114 @@
+---
+title: Organizations
+description: Enable the Organizations feature in Keycloak 26 and model tenants, invites, and org roles
+---
+
+## Enable the Feature
+
+Organizations is GA in Keycloak 26 but still off by default. Enable it per-realm:
+
+**Realm settings → General → Organizations** → **On** → Save.
+
+This adds an **Organizations** item to the left nav and exposes the `organization` scope on clients.
+
+<Callout type="info">
+Under the hood Keycloak stores organizations as a specialized group tree. Don't edit those groups directly — always go through the Organizations UI/API.
+</Callout>
+
+## Attach the `organization` Scope
+
+For every client that needs the org claim in its tokens (the gateway and all frontends):
+
+**Clients → (client) → Client scopes → Add client scope → `organization` → Default**
+
+Now access tokens minted for that client include:
+
+```json
+{
+  "organization": {
+    "acme": {
+      "id": "b9f2c1a0-1234-5678-9abc-def012345678",
+      "roles": ["org-owner"]
+    }
+  }
+}
+```
+
+The keys are organization **aliases** (slugs). If a user belongs to multiple organizations, multiple keys appear.
+
+## Create the First Organization
+
+**Organizations → Create organization**
+
+| Field | Example |
+| --- | --- |
+| Name | `Acme Corp` |
+| Alias | `acme` (used as slug in tokens/URLs) |
+| Redirect URL | `https://app.example.com/orgs/acme` |
+| Domains | `acme.test` — auto-joins users registering with matching email domain |
+
+## Org-Scoped Roles
+
+Keycloak's organization membership can carry roles scoped to *just that organization*. By default it ships with `manage-organization` and `view-organization`. Add our own:
+
+**Organizations → Acme Corp → Roles → Create role**
+
+| Role | Purpose |
+| --- | --- |
+| `org-owner` | Full control of this org |
+| `org-admin` | Manage members, not billing |
+| `org-member` | Default for invited users |
+
+These org-level roles appear in `organization["acme"].roles` in the token — separate from realm-level roles.
+
+## Inviting a User
+
+Two paths:
+
+### 1. Invite by email (user doesn't exist yet)
+
+**Organizations → Acme Corp → Members → Add member → Send invitation email**
+
+Keycloak sends an email with a signed link. When clicked it runs the **Invitation** authentication flow, which registers the user, auto-verifies their email, and adds them to the org.
+
+### 2. Add an existing user
+
+**Organizations → Acme Corp → Members → Add member → Add existing user** → search.
+
+## Identity Provider per Org
+
+Each org can have its own IdP (SAML / OIDC) bound to it — useful for enterprise SSO:
+
+**Organizations → Acme Corp → Identity providers → Add provider**
+
+Users logging in through this IdP are automatically added as members of Acme.
+
+## Verifying
+
+After invitation, the new user's token should carry:
+
+```json
+{
+  "preferred_username": "bob",
+  "email": "bob@acme.test",
+  "realm_access": { "roles": ["org-user"] },
+  "organization": {
+    "acme": {
+      "id": "b9f2c1a0-1234-5678-9abc-def012345678",
+      "roles": ["org-member"]
+    }
+  }
+}
+```
+
+The gateway can now authorize "bob can view org `acme`" from a single token claim — no extra DB hit.
+
+## Common Pitfalls
+
+- **No `organization` claim in the token.** The user isn't a member, or the client scope isn't attached, or you decoded an ID token instead of an access token.
+- **User in multiple orgs, wrong one is "active".** There is no *active org* concept in Keycloak — the frontend chooses one from the claim and sends it as context (`X-Org-Alias` header) on every request. The gateway then verifies that alias is actually in the user's token.
+- **Changing an org's alias** invalidates existing redirect URLs and any cached claims. Treat alias as immutable once issued.
+
+## Next
+
+→ [Email & SMS](./email-and-sms)
