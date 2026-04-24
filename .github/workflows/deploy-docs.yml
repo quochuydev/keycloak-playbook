@@ -23,8 +23,6 @@ jobs:
     defaults:
       run:
         working-directory: docs
-    env:
-      NEXT_PUBLIC_BASE_PATH: /keycloak-playbook
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +38,9 @@ jobs:
 
       - name: Disable Jekyll
         run: touch out/.nojekyll
+
+      - name: Write CNAME
+        run: echo 'keycloak.quochuy.dev' > out/CNAME
 
       - uses: actions/configure-pages@v5
 
